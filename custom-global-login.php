@@ -43,12 +43,13 @@ function cgl_register_settings() {
     register_setting('cgl_settings_group', 'cgl_login_logo');
     register_setting('cgl_settings_group', 'cgl_login_hero');
     register_setting('cgl_settings_group', 'cgl_primary_color');
-    register_setting('cgl_settings_group', 'cgl_maintenance_mode');
+    register_setting('cgl_settings_group', 'cgl_maintenance_mode', 'intval');
     register_setting('cgl_settings_group', 'cgl_maintenance_text');
     register_setting('cgl_settings_group', 'cgl_maintenance_bg_color');
     register_setting('cgl_settings_group', 'cgl_maintenance_text_color');
     register_setting('cgl_settings_group', 'cgl_maintenance_logo');
     register_setting('cgl_settings_group', 'cgl_maintenance_end_date');
+    register_setting('cgl_settings_group', 'cgl_maintenance_title');
     register_setting('cgl_settings_group', 'cgl_custom_login_slug');
 
 }
@@ -83,13 +84,19 @@ function cgl_render_settings_page() { ?>
                         <input type="text" name="cgl_primary_color" value="<?php echo esc_attr(get_option('cgl_primary_color', '#57215f')); ?>" class="cgl-color-field" data-default-color="#57215f">
                     </td>
                 </tr>
-                <tr>
+               <tr>
                     <th>Maintenance Mode</th>
                     <td>
                         <label>
                             <input type="checkbox" name="cgl_maintenance_mode" value="1" <?php checked(1,get_option('cgl_maintenance_mode')); ?>>
                             Enable maintenance mode
                         </label>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Maintenance Titel</th>
+                    <td>
+                        <input type="text" name="cgl_maintenance_title" value="<?php echo esc_attr(get_option('cgl_maintenance_title','We are working on the site. Come back later.')); ?>" style="width:100%;">
                     </td>
                 </tr>
                 <tr>
@@ -126,6 +133,7 @@ function cgl_render_settings_page() { ?>
                           value="<?php echo esc_attr(get_option('cgl_maintenance_end_date')); ?>"
                           style="width:250px;">
                         <p class="description">Choose date & time (ex: +2 hours)</p>
+                        <p class="description">If no end date is set, maintenance mode will stay enabled until you turn it off manually.</p>
                     </td>
                 </tr>
 
@@ -215,41 +223,53 @@ add_action('template_redirect','cgl_maintenance_mode');
  * ===================================================== */
 function cgl_maintenance_mode() {
 
-    if (!get_option('cgl_maintenance_mode')) return;
+    // If maintenance not enabled → do nothing
+    if (!get_option('cgl_maintenance_mode')) {
+        return;
+    }
 
-    // auto-disable after end date
+    // Auto-disable ONLY if end date exists AND is expired
     $end = get_option('cgl_maintenance_end_date');
-    if ($end && strtotime($end) < current_time('timestamp')) {
+    if ($end && strtotime($end) <= current_time('timestamp')) {
         update_option('cgl_maintenance_mode', 0);
         return;
     }
 
-    // allow admins
-    if (current_user_can('manage_options')) return;
+    // Allow admins
+    if (current_user_can('manage_options')) {
+        return;
+    }
 
+    // Allow login access
     $slug = trim(get_option('cgl_custom_login_slug','my-login'),'/');
-
-    // allow login pages
     if (
         is_admin() ||
-        strpos($_SERVER['REQUEST_URI'],'wp-login.php') !== false ||
-        strpos($_SERVER['REQUEST_URI'],'/'.$slug) !== false
-    ) return;
+        strpos($_SERVER['REQUEST_URI'], 'wp-login.php') !== false ||
+        strpos($_SERVER['REQUEST_URI'], '/' . $slug) !== false
+    ) {
+        return;
+    }
 
+    // Show maintenance page
     status_header(503);
     include plugin_dir_path(__FILE__) . 'maintenance.php';
     exit;
 }
-add_action('template_redirect','cgl_maintenance_mode');
+add_action('template_redirect', 'cgl_maintenance_mode');
 
 function cgl_auto_disable_maintenance() {
     $end = get_option('cgl_maintenance_end_date');
-    if ($end && strtotime($end) < current_time('timestamp')) {
+    if (!empty($end) && strtotime($end) < current_time('timestamp')) {
         update_option('cgl_maintenance_mode', 0);
     }
 }
 add_action('init', 'cgl_auto_disable_maintenance');
 
+
+
+/* =====================================================
+ * CUSTOM LOGIN URL – FORCE ONLY CUSTOM SLUG
+ * ===================================================== */
 /* =====================================================
  * CUSTOM LOGIN URL – FORCE ONLY CUSTOM SLUG
  * ===================================================== */
@@ -264,9 +284,13 @@ function cgl_force_custom_login_only() {
     // Allow only custom login URL
     if (strpos($request_uri, '/' . $slug) !== false) return;
 
-    // Block wp-login.php
+    // Block wp-login.php (but allow POST for login actions, and GET with 'action' for logout/lostpassword)
     if (strpos($request_uri, 'wp-login.php') !== false || strpos($request_uri, 'wp-admin') !== false) {
-        wp_redirect(home_url('/' . $slug)); // redirect to custom login
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') return; // Allow form submission
+        if (isset($_GET['action'])) return; // Allow actions like logout
+        
+        // Redirect to custom login with index.php for compatibility
+        wp_redirect(home_url('/index.php/' . $slug));
         exit;
     }
 }
@@ -338,6 +362,19 @@ function cgl_early_url_detection() {
 
     // Check robustly
     if ($path === $slug) {
+        // Prepare globals for wp-login.php to avoid scope warnings
+        global $user_login, $error, $action, $user_identity;
+        
+        // Force empty username on fresh GET request to avoid auto-filling
+        if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+             $user_login = '';
+             $error = '';
+        } else {
+            // Keep existing values or init if missing
+            if (!isset($user_login)) $user_login = '';
+            if (!isset($error)) $error = '';
+        }
+        
         status_header(200);
         require_once ABSPATH . 'wp-login.php';
         exit;
@@ -384,16 +421,40 @@ function cgl_check_rewrite_rules() {
 add_action('admin_init', 'cgl_check_rewrite_rules');
 
 
-// Force logout redirect to custom login page
-function cgl_custom_logout_redirect($logout_url, $redirect) {
+// Redirect to custom login AFTER logout (instead of breaking the logout link)
+function cgl_custom_logout_redirect($redirect_to, $requested_redirect_to, $user) {
     $slug = trim(get_option('cgl_custom_login_slug', 'my-login'), '/');
-    $custom_login = home_url('/index.php/' . $slug);
-    if (!empty($redirect)) {
-        $custom_login = add_query_arg('redirect_to', urlencode($redirect), $custom_login);
-    }
-    return $custom_login;
+    return home_url('/index.php/' . $slug);
 }
-add_filter('logout_url', 'cgl_custom_logout_redirect', 10, 2);
+add_filter('logout_redirect', 'cgl_custom_logout_redirect', 10, 3);
+
+
+/* =====================================================
+ * EXPLICIT LOGOUT HANDLER (Bypass wp-login.php blockers)
+ * ===================================================== */
+function cgl_handle_logout_request() {
+    if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+        // Verify nonce if present (standard WP logout link)
+        // We use check_admin_referer which dies if invalid, securing the action
+        check_admin_referer('log-out');
+        
+        // Execute logout
+        wp_logout();
+        
+        // Redirect to custom login
+        $slug = trim(get_option('cgl_custom_login_slug', 'my-login'), '/');
+        $redirect_to = home_url('/index.php/' . $slug);
+        
+        // Preserve redirect_to param if it existed and is safe
+        if (!empty($_GET['redirect_to'])) {
+            $redirect_to = add_query_arg('redirect_to', urlencode($_GET['redirect_to']), $redirect_to);
+        }
+        
+        wp_redirect($redirect_to);
+        exit;
+    }
+}
+add_action('init', 'cgl_handle_logout_request', 1); // Run early
 
 
 function cgl_fix_wp_login_warnings() {
